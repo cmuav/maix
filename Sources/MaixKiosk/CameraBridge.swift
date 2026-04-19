@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import CoreImage
+import VideoToolbox
 import Accelerate
 import AppKit
 import Darwin
@@ -31,6 +32,9 @@ final class CameraBridge: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     private var idleTimer: DispatchSourceTimer?
     private var idleFrame: Data = Data()
     private var mode: Mode = .idle
+    private var cameraIndex: Int = 0
+    private var xferSession: VTPixelTransferSession?
+    private var outPool: CVPixelBufferPool?
 
     private enum Mode { case idle, live }
 
@@ -153,8 +157,47 @@ final class CameraBridge: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         switch cmd.uppercased() {
         case "GO":   switchToLive()
         case "STOP": switchToIdle()
+        case "NEXT": cycleCamera()
         default:     NSLog("CameraBridge: unknown control \(cmd)")
         }
+    }
+
+    private func cycleCamera() {
+        let devices = availableCameraDevices()
+        guard !devices.isEmpty else {
+            NSLog("CameraBridge: NEXT requested but no cameras available")
+            return
+        }
+        cameraIndex = (cameraIndex + 1) % devices.count
+        NSLog("CameraBridge: NEXT → \(devices[cameraIndex].localizedName) (index \(cameraIndex))")
+        if mode == .live {
+            stopCapture()
+            startCapture()
+        }
+    }
+
+    private func availableCameraDevices() -> [AVCaptureDevice] {
+        // macOS exposes Continuity Camera as a single AVCaptureDevice plus
+        // a separate Desk View device. Switching between the iPhone's lenses
+        // (wide / ultra-wide / front) is iOS-side — do it from Control
+        // Center on the phone. The iOS-only DeviceType values
+        // (builtInUltraWideCamera, etc.) are not available on macOS.
+        var types: [AVCaptureDevice.DeviceType] = [
+            .builtInWideAngleCamera,
+            .external,
+        ]
+        if #available(macOS 13.0, *) {
+            types.append(.deskViewCamera)
+        }
+        if #available(macOS 14.0, *) {
+            types.append(.continuityCamera)
+        }
+        let discovered = AVCaptureDevice.DiscoverySession(
+            deviceTypes: types, mediaType: .video, position: .unspecified
+        ).devices
+
+        var seen = Set<String>()
+        return discovered.filter { seen.insert($0.uniqueID).inserted }
     }
 
     // MARK: - Mode switching
@@ -196,16 +239,17 @@ final class CameraBridge: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         idleTimer = nil
     }
 
-    /// Solid dark-gray YUYV frame. Byte order Y U Y V per 2 pixels.
+    /// Solid dark-gray UYVY frame (byte order U Y V Y per 2 pixels).
+    /// Values are in BT.601 video range.
     private static func makeStandbyUYVY(width: Int, height: Int) -> Data {
         var d = Data(count: width * height * 2)
-        let y: UInt8 = 24   // dark gray luma
-        let uv: UInt8 = 128 // neutral chroma
+        let y: UInt8 = 24    // dark gray luma (video range, near black)
+        let uv: UInt8 = 128  // neutral chroma
         d.withUnsafeMutableBytes { raw in
             let p = raw.bindMemory(to: UInt8.self)
             var i = 0
             while i < p.count {
-                p[i] = y; p[i+1] = uv; p[i+2] = y; p[i+3] = uv
+                p[i] = uv; p[i+1] = y; p[i+2] = uv; p[i+3] = y
                 i += 4
             }
         }
@@ -234,14 +278,16 @@ final class CameraBridge: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
 
         let output = AVCaptureVideoDataOutput()
         // UYVY ('2vuy') — native camera format, zero software conversion.
-        // 'yuvs' = packed YUYV/YUY2 — the native webcam format most v4l2
-        // apps (Cheese, Zoom, OBS, gstreamer) expect. Byte order Y U Y V per
-        // 2-pixel macroblock. No conversion anywhere in the pipeline.
+        // '2vuy' = packed UYVY, video-range BT.601 Y'CbCr (16..235/240). Ask
+        // AVFoundation for UYVY at the camera's native resolution; we resize
+        // to (captureWidth, captureHeight) ourselves via VTPixelTransferSession
+        // so that every frame fed into v4l2loopback has the exact dimensions
+        // the guest-side ffmpeg rawvideo demuxer expects. WidthKey/HeightKey
+        // here are advisory and most Continuity / iPhone capture paths ignore
+        // them, which produces a tile-pattern garbage frame in the guest.
         output.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String:
-                kCVPixelFormatType_422YpCbCr8_yuvs,
-            kCVPixelBufferWidthKey as String: Self.captureWidth,
-            kCVPixelBufferHeightKey as String: Self.captureHeight,
+                kCVPixelFormatType_422YpCbCr8,
         ]
         output.alwaysDiscardsLateVideoFrames = true
         output.setSampleBufferDelegate(self, queue: q)
@@ -261,10 +307,10 @@ final class CameraBridge: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     }
 
     private func bestCameraDevice() -> AVCaptureDevice? {
-        let types: [AVCaptureDevice.DeviceType] = [.external, .builtInWideAngleCamera]
-        let d = AVCaptureDevice.DiscoverySession(
-            deviceTypes: types, mediaType: .video, position: .unspecified)
-        return d.devices.first ?? AVCaptureDevice.default(for: .video)
+        let devices = availableCameraDevices()
+        if devices.isEmpty { return AVCaptureDevice.default(for: .video) }
+        if cameraIndex >= devices.count { cameraIndex = 0 }
+        return devices[cameraIndex]
     }
 
     private func configureActiveFormat(on device: AVCaptureDevice) throws {
@@ -292,23 +338,58 @@ final class CameraBridge: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         guard mode == .live, dataFD >= 0,
-              let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        CVPixelBufferLockBaseAddress(pb, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-        let base = CVPixelBufferGetBaseAddress(pb)!
-        let bpr  = CVPixelBufferGetBytesPerRow(pb)
-        let h    = CVPixelBufferGetHeight(pb)
+              let inBuf = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        ensurePixelTransfer()
+        guard let pool = outPool, let xfer = xferSession else { return }
+
+        var outBuf: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outBuf) == kCVReturnSuccess,
+              let outBuf = outBuf,
+              VTPixelTransferSessionTransferImage(xfer, from: inBuf, to: outBuf) == noErr
+        else { return }
+
+        CVPixelBufferLockBaseAddress(outBuf, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(outBuf, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(outBuf) else { return }
+        let bpr  = CVPixelBufferGetBytesPerRow(outBuf)
+        let h    = CVPixelBufferGetHeight(outBuf)
         let rowBytes = Self.captureWidth * 2
         if bpr == rowBytes {
-            // Contiguous: one shot.
             writeBytesRaw(pointer: base.assumingMemoryBound(to: UInt8.self),
                           count: bpr * h)
         } else {
-            // Strided: row-by-row (avoids sending padding).
             let p = base.assumingMemoryBound(to: UInt8.self)
             for y in 0..<h {
                 writeBytesRaw(pointer: p.advanced(by: y * bpr), count: rowBytes)
             }
+        }
+    }
+
+    private func ensurePixelTransfer() {
+        if xferSession == nil {
+            var s: VTPixelTransferSession?
+            VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &s)
+            if let s = s {
+                // Fit the source into the target keeping aspect; any extra
+                // space is filled black. Avoids subtle stretch when camera
+                // aspect doesn't match 16:9.
+                VTSessionSetProperty(s,
+                    key: kVTPixelTransferPropertyKey_ScalingMode,
+                    value: kVTScalingMode_Letterbox)
+            }
+            xferSession = s
+        }
+        if outPool == nil {
+            let attrs: [CFString: Any] = [
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_422YpCbCr8,
+                kCVPixelBufferWidthKey: Self.captureWidth,
+                kCVPixelBufferHeightKey: Self.captureHeight,
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+            ]
+            var pool: CVPixelBufferPool?
+            CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool)
+            outPool = pool
         }
     }
 

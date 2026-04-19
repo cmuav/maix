@@ -14,7 +14,6 @@ final class KioskWindowController: NSObject, NSWindowDelegate {
     private(set) var renderer: CSMetalRenderer?
     private var currentDisplay: CSDisplay?
     private var serialConsole: SerialConsoleView?
-    private var efiDisplaySize: CGSize?
 
     override init() {
         let screenFrame = NSScreen.main?.frame
@@ -97,11 +96,8 @@ final class KioskWindowController: NSObject, NSWindowDelegate {
             display.addRenderer(r)
         }
         currentDisplay = display
-        // Do NOT hide the console yet — EDK2 has drawn a "Display output is
-        // not active" frame to the virtio-gpu framebuffer. Keep the boot log
-        // visible until the guest changes resolution (Linux kernel / Plymouth
-        // taking over from EFI). displayUpdated will trigger the hide.
-        efiDisplaySize = display.displaySize
+        // Keep the serial console on top throughout GRUB and Linux boot.
+        // onAgentConnected (spice-vdagent up) is what flips us to SPICE.
         rescaleToFit()
         NSLog("KioskWindow: attached to SPICE display (monitorID=\(display.monitorID) size=\(display.displaySize))")
     }
@@ -126,14 +122,16 @@ final class KioskWindowController: NSObject, NSWindowDelegate {
 
     // MARK: - NSWindowDelegate
 
-    /// Call on CSDisplay size updates. Hides the serial console once the
-    /// guest OS has taken over from EFI (first resolution change post-attach).
+    /// Called when CSDisplay's reported size changes. Just rescale; we don't
+    /// use this as the hide-console trigger anymore.
     func handleDisplayUpdated() {
-        guard let cur = currentDisplay else { return }
-        if let efi = efiDisplaySize, cur.displaySize != efi {
-            hideSerialConsole()
-            efiDisplaySize = nil
-        }
+        rescaleToFit()
+    }
+
+    /// Called once spice-vdagent is up in the guest. Userspace is alive, so
+    /// swap from the serial log overlay to the live framebuffer.
+    func handleAgentConnected() {
+        hideSerialConsole()
         rescaleToFit()
     }
 

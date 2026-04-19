@@ -202,8 +202,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSLog("SPICE error: \(msg)")
         }
         spice.onAgentConnected = { [weak self] in
-            // vdagent is up now — nudge the guest to match our window size.
-            self?.controller?.rescaleToFit()
+            // vdagent is up — userspace is ready. Hide the serial console,
+            // reveal the live SPICE framebuffer, and nudge the guest to
+            // match our window size.
+            self?.controller?.handleAgentConnected()
         }
         spice.onConnected = { [weak self] conn in
             guard let self = self else { return }

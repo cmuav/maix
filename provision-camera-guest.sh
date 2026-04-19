@@ -101,24 +101,46 @@ wait_for "$DEV"       || exit 0
 exec 9<>"$CTRL_PORT"
 say() { printf '%s\n' "$1" >&9; }
 
-# Always-on producer. Raw YUYV (YUY2) straight from host — no decode, no
-# format conversion. v4l2loopback advertises YUYV to consumers, which is the
-# webcam-native format every v4l2 app (Cheese, Zoom, OBS, browsers) handles.
-# Must match CameraBridge.captureWidth/captureHeight/targetFPS in Maix.
+# Expose a FIFO so unprivileged helpers (maix-next-camera, future tools) can
+# inject control lines without racing the supervisor on /dev/virtio-ports/*.
+# The FIFO is the only multi-writer surface; supervisor is the sole reader
+# and the sole writer to the virtio port.
+FIFO=/run/maix-camera.fifo
+# World-writable is fine — the supervisor is the sole reader and only
+# recognizes a fixed set of commands (GO/STOP/NEXT); there's no sensitive
+# state here. Alternative would be to gate on the 'video' group, but that
+# requires users to log out/in before the CLI works.
+rm -f "$FIFO"
+mkfifo "$FIFO"
+chmod 0666 "$FIFO"
+# Hold the FIFO open so writers don't see EOF between messages.
+exec 8<>"$FIFO"
+
+# Background line forwarder: FIFO -> control port.
+while read -r line <&8; do
+    say "$line"
+done &
+FWD_PID=$!
+
+# Always-on producer. Raw UYVY (2vuy) straight from host — no decode, no
+# format conversion. AVFoundation outputs this in video-range BT.601, which
+# is what v4l2 consumers on Linux expect. Must match CameraBridge
+# captureWidth/captureHeight/targetFPS in Maix.
 WIDTH=1280
 HEIGHT=720
 FPS=30
 ffmpeg -hide_banner -loglevel error \
     -fflags +nobuffer -flags low_delay -probesize 32 -analyzeduration 0 \
     -thread_queue_size 512 \
-    -f rawvideo -pix_fmt yuyv422 -video_size ${WIDTH}x${HEIGHT} -framerate ${FPS} \
+    -f rawvideo -pix_fmt uyvy422 -video_size ${WIDTH}x${HEIGHT} -framerate ${FPS} \
     -i "$DATA_PORT" \
-    -f v4l2 -pix_fmt yuyv422 "$DEV" &
+    -f v4l2 -pix_fmt uyvy422 "$DEV" &
 FFPID=$!
 
 cleanup() {
     kill "$FFPID" 2>/dev/null || true
     wait "$FFPID" 2>/dev/null || true
+    kill "$FWD_PID" 2>/dev/null || true
     say "STOP"
     exit 0
 }
@@ -143,6 +165,31 @@ while :; do
 done
 SH
 chmod +x /usr/local/sbin/maix-camera-supervisor
+
+# CLI: write NEXT through the supervisor's FIFO so there's no virtio-port
+# contention. Runs unprivileged as long as the user is in the 'video' group.
+cat >/usr/local/bin/maix-next-camera <<'SH'
+#!/usr/bin/env bash
+printf 'NEXT\n' > /run/maix-camera.fifo
+SH
+chmod +x /usr/local/bin/maix-next-camera
+
+# Desktop entry so it appears in the app grid / search as "Swap Camera".
+cat >/usr/share/applications/maix-swap-camera.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Swap Camera
+Comment=Cycle to the next host camera (built-in, external, Continuity)
+Exec=/usr/local/bin/maix-next-camera
+Icon=camera-web-symbolic
+Terminal=false
+Categories=Utility;Video;
+EOF
+
+# Remove any old udev rule from a previous install — the virtio port is now
+# supervisor-exclusive; unprivileged access goes through the FIFO instead.
+rm -f /etc/udev/rules.d/99-maix-camera.rules
+udevadm control --reload 2>/dev/null || true
 
 cat >/etc/systemd/system/maix-camera.service <<'EOF'
 [Unit]
