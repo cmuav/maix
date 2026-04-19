@@ -1,6 +1,6 @@
 import Cocoa
 import MetalKit
-import CocoaSpiceNoUsb
+import CocoaSpice
 import CocoaSpiceRenderer
 
 final class KioskNSWindow: NSWindow {

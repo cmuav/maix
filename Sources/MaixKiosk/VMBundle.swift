@@ -15,6 +15,27 @@ struct VMBundle {
         self.efiVars = root.appendingPathComponent(Config.efiVarsName)
         self.spiceSocket = root.appendingPathComponent("spice.sock")
         self.serialLog = root.appendingPathComponent("serial.log")
+        self.usbConfig = root.appendingPathComponent(Config.usbConfigName)
+    }
+
+    let usbConfig: URL
+    var cameraSocket: URL { root.appendingPathComponent("camera.sock") }
+    var cameraControlSocket: URL { root.appendingPathComponent("camera-control.sock") }
+
+    func ensureUSBConfigExists() {
+        guard !FileManager.default.fileExists(atPath: usbConfig.path) else { return }
+        let template = """
+        # Maix USB pass-through config.
+        # One device per line. Format: VENDOR:PRODUCT     # optional label
+        # Hex IDs. Find IDs with ./list-usb-mbn.sh on the build host.
+        # Changes take effect on next Maix launch. Device must be plugged in
+        # when the VM boots.
+        #
+        # Example (Logitech HD Webcam C270):
+        # 046d:0825   Logitech C270
+        """
+        FileManager.default.createFile(atPath: usbConfig.path,
+                                       contents: template.data(using: .utf8))
     }
 
     var isFirstRun: Bool { !FileManager.default.fileExists(atPath: efiVars.path) }

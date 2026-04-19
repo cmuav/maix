@@ -16,7 +16,7 @@
 
 import Carbon.HIToolbox
 import MetalKit
-import CocoaSpiceNoUsb
+import CocoaSpice
 import MaixStubs
 
 class VMMetalView: MTKView {

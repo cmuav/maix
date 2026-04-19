@@ -12,6 +12,7 @@ enum Config {
     static let diskImageName = "disk.img"
     static let installerISOName = "installer.iso"
     static let efiVarsName = "efi_vars.fd"
+    static let usbConfigName = "usb.conf"
 
     static let cpuCount: Int = {
         let host = ProcessInfo.processInfo.processorCount

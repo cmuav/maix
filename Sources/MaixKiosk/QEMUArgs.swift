@@ -14,12 +14,42 @@ import AppKit
 ///   Contents/Resources/qemu/efi-virtio.rom
 ///   Contents/Resources/qemu/keymaps/...
 enum QEMUArgs {
+    /// How many concurrent SPICE USB-redir channels to provision. Each slot
+    /// can hold one attached host device.
+    static let usbRedirSlotCount = 4
+
     struct Paths {
         let launcher: URL
         let qemuDylib: URL
         let biosDir: URL
         let edk2Code: URL
         let edk2VarsTemplate: URL
+    }
+
+    /// Parse `VENDOR:PRODUCT   optional label` lines. Skips blanks and #-comments.
+    static func parseUSBConfig(url: URL) -> [(Int, Int, String)] {
+        guard let raw = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        var out: [(Int, Int, String)] = []
+        for rawLine in raw.split(separator: "\n", omittingEmptySubsequences: false) {
+            var line = String(rawLine)
+            if let hashIdx = line.firstIndex(of: "#") {
+                line = String(line[..<hashIdx])
+            }
+            line = line.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+            let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+            guard let idPart = parts.first else { continue }
+            let ids = idPart.split(separator: ":").map(String.init)
+            guard ids.count == 2,
+                  let vid = Int(ids[0], radix: 16),
+                  let pid = Int(ids[1], radix: 16) else {
+                NSLog("usb.conf: skipping malformed line \(rawLine)")
+                continue
+            }
+            let label = parts.dropFirst().joined(separator: " ")
+            out.append((vid, pid, label))
+        }
+        return out
     }
 
     static func primaryScreenPixels() -> (Int, Int) {
@@ -76,14 +106,22 @@ enum QEMUArgs {
                   "if=virtio,format=raw,media=cdrom,readonly=on,file=\(bundle.installerISO.path)"]
         }
 
-        // Network (user-mode for now; bridged/vmnet requires entitlement or sudo)
-        a += ["-netdev", "user,id=net0"]
+        // Network (user-mode for now; bridged/vmnet requires entitlement or
+        // sudo). hostfwd maps mbn.local:2222 -> guest:22 for debugging.
+        a += ["-netdev", "user,id=net0,hostfwd=tcp::2222-:22"]
         a += ["-device", "virtio-net-pci,netdev=net0"]
 
         // USB controller + input
         a += ["-device", "qemu-xhci,id=xhci"]
         a += ["-device", "usb-kbd,bus=xhci.0"]
         a += ["-device", "usb-tablet,bus=xhci.0"]
+
+        // SPICE USB redirection slots. Host-side CSUSBManager claims devices
+        // via libusb and tunnels URBs over these chardevs. One device per slot.
+        for i in 0..<usbRedirSlotCount {
+            a += ["-chardev", "spicevmc,name=usbredir,id=usbredirchardev\(i)"]
+            a += ["-device", "usb-redir,chardev=usbredirchardev\(i),id=usbredirdev\(i),bus=xhci.0"]
+        }
 
         // Graphics: virtio-gpu with GL (rendered by virglrenderer → SPICE).
         // Boot-time default mode sized to the main display's native pixels so
@@ -112,11 +150,31 @@ enum QEMUArgs {
         a += ["-chardev", "spiceport,name=org.qemu.monitor.qmp.0,id=qmp"]
         a += ["-mon", "chardev=qmp,mode=control"]
 
+        // virtio-serial-pci hosts named ports: spice-vdagent and our camera
+        // side-channel.
+        a += ["-device", "virtio-serial-pci"]
+
         // SPICE vdagent channel (clipboard / dynamic resize). Guest needs
         // `spice-vdagent` package + `spice-vdagentd.service` running.
-        a += ["-device", "virtio-serial-pci"]
         a += ["-chardev", "spicevmc,id=vdagent,debug=0,name=vdagent"]
         a += ["-device", "virtserialport,chardev=vdagent,name=com.redhat.spice.0"]
+
+        // Camera side-channel. qemu listens on ~/MaixVM/camera.sock; Maix
+        // connects as client and writes an MJPEG stream. Guest sees
+        // /dev/virtio-ports/com.cmuav.camera — a guest-side daemon reads the
+        // MJPEG stream and pipes it into v4l2loopback as /dev/video0.
+        try? FileManager.default.removeItem(at: bundle.cameraSocket)
+        try? FileManager.default.removeItem(at: bundle.cameraControlSocket)
+        a += ["-chardev",
+              "socket,id=maixcam,path=\(bundle.cameraSocket.path),server=on,wait=off"]
+        a += ["-device", "virtserialport,chardev=maixcam,name=com.cmuav.camera"]
+        // Control port: guest sends GO / STOP lines; host gates real capture.
+        // When "stopped" the host still writes a standby frame so the guest's
+        // v4l2loopback producer stays fed and consumers can STREAMON.
+        a += ["-chardev",
+              "socket,id=maixcamctl,path=\(bundle.cameraControlSocket.path),server=on,wait=off"]
+        a += ["-device",
+              "virtserialport,chardev=maixcamctl,name=com.cmuav.camera.control"]
 
         // No default devices / no local display — SPICE is our display.
         a += ["-nodefaults"]

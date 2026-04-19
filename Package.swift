@@ -12,6 +12,8 @@ let spiceFrameworks: [String] = [
     "json-glib-1.0.0",
     "spice-client-glib-2.0.8",
     "pixman-1.0", "jpeg.62",
+    // USB redirection
+    "usb-1.0.0", "usbredirparser.1", "usbredirhost.1",
 ]
 
 let linkedFrameworks: [LinkerSetting] = spiceFrameworks.flatMap {
@@ -38,7 +40,7 @@ let package = Package(
         .executableTarget(
             name: "MaixKiosk",
             dependencies: [
-                .product(name: "CocoaSpiceNoUsb", package: "CocoaSpice"),
+                .product(name: "CocoaSpice", package: "CocoaSpice"),
                 "MaixStubs",
             ],
             path: "Sources/MaixKiosk",

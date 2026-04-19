@@ -1,5 +1,5 @@
 import Cocoa
-import CocoaSpiceNoUsb
+import CocoaSpice
 
 /// Routes input events from VMMetalView to CSInput. Minimal port of UTM's
 /// display controller input path.

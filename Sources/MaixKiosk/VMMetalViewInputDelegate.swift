@@ -15,7 +15,7 @@
 //
 
 import Cocoa
-import CocoaSpiceNoUsb
+import CocoaSpice
 
 protocol VMMetalViewInputDelegate: AnyObject {
     var shouldUseCmdOptForCapture: Bool { get }

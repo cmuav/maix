@@ -1,5 +1,6 @@
 import Cocoa
 import UniformTypeIdentifiers
+import AVFoundation
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controller: KioskWindowController?
@@ -9,6 +10,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var spice: SpiceIO?
     private var inputRouter: SpiceInputRouter?
     private var socketWaiter: DispatchSourceTimer?
+    private var usbAuto: SpiceUSBAutoConnect?
+    private var camera: CameraBridge?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if Config.kioskMode {
@@ -21,10 +24,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         installDefaultMenu()
+        requestMediaPermissions()
 
         do {
             let bundle = VMBundle()
             try bundle.ensureExists()
+            bundle.ensureUSBConfigExists()
             self.bundle = bundle
 
             guard let paths = QEMUArgs.resolvePaths() else {
@@ -51,6 +56,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let argv = QEMUArgs.build(bundle: bundle, paths: paths)
             let logURL = bundle.root.appendingPathComponent("qemu.log")
             try qemu.start(paths: paths, args: argv, logURL: logURL)
+
+            let cam = CameraBridge(
+                dataSocketPath: bundle.cameraSocket.path,
+                controlSocketPath: bundle.cameraControlSocket.path
+            )
+            cam.start()
+            self.camera = cam
 
             controller.showSerialConsole(tailing: bundle.serialLog)
             waitForSpiceSocket(bundle: bundle, controller: controller)
@@ -103,6 +115,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Menu / escape
+
+    private func requestMediaPermissions() {
+        // Explicitly ask TCC for mic + camera. Without this the prompt never
+        // surfaces when qemu's CoreAudio code opens the device lazily from a
+        // subprocess, because TCC needs a request from the responsible bundle.
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
+            NSLog("Microphone access: \(granted ? "granted" : "denied")")
+        }
+        AVCaptureDevice.requestAccess(for: .video) { granted in
+            NSLog("Camera access: \(granted ? "granted" : "denied")")
+        }
+    }
 
     private func installDefaultMenu() {
         let main = NSMenu()
@@ -180,6 +204,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         spice.onAgentConnected = { [weak self] in
             // vdagent is up now — nudge the guest to match our window size.
             self?.controller?.rescaleToFit()
+        }
+        spice.onConnected = { [weak self] conn in
+            guard let self = self else { return }
+            let wanted = QEMUArgs.parseUSBConfig(url: bundle.usbConfig)
+                .map { ($0.0, $0.1) }
+            self.usbAuto = SpiceUSBAutoConnect(manager: conn.usbManager, wanted: wanted)
+            if wanted.isEmpty {
+                NSLog("USB: no entries in \(bundle.usbConfig.path); passthrough disabled.")
+            } else {
+                NSLog("USB: watching \(wanted.count) VID:PID filter(s).")
+            }
         }
         spice.onDisplayUpdated = { [weak self] _ in
             self?.controller?.handleDisplayUpdated()

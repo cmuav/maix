@@ -1,5 +1,5 @@
 import Foundation
-import CocoaSpiceNoUsb
+import CocoaSpice
 import CocoaSpiceRenderer
 
 /// Wraps CSMain + CSConnection for a unix-socket SPICE server.
@@ -7,7 +7,7 @@ import CocoaSpiceRenderer
 final class SpiceIO: NSObject, CSConnectionDelegate {
     let socketURL: URL
     private var spice: CSMain?
-    private var connection: CSConnection?
+    private(set) var connection: CSConnection?
     private(set) var primaryDisplay: CSDisplay?
     private(set) var primaryInput: CSInput?
 
@@ -65,8 +65,14 @@ final class SpiceIO: NSObject, CSConnectionDelegate {
 
     // MARK: - CSConnectionDelegate
 
+    /// Called on main queue once the SPICE main channel is open (usbManager available).
+    var onConnected: ((CSConnection) -> Void)?
+
     func spiceConnected(_ connection: CSConnection) {
         NSLog("SPICE connected.")
+        DispatchQueue.main.async { [weak self] in
+            self?.onConnected?(connection)
+        }
     }
 
     func spiceInputAvailable(_ connection: CSConnection, input: CSInput) {
