@@ -1,25 +1,21 @@
 import Cocoa
-import Virtualization
 import UniformTypeIdentifiers
 
-final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelegate {
-    private var vm: VZVirtualMachine?
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controller: KioskWindowController?
     private var bundle: VMBundle?
+    private var qemu: QEMUProcess?
     private var escapeMonitor: Any?
-    private var balloonController: BalloonController?
-    private var guestAgent: GuestAgentBridge?
+    private var spice: SpiceIO?
+    private var inputRouter: SpiceInputRouter?
+    private var socketWaiter: DispatchSourceTimer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if Config.kioskMode {
             NSApp.presentationOptions = [
-                .hideDock,
-                .hideMenuBar,
-                .disableProcessSwitching,
-                .disableForceQuit,
-                .disableSessionTermination,
-                .disableMenuBarTransparency,
-                .disableAppleMenu,
+                .hideDock, .hideMenuBar,
+                .disableProcessSwitching, .disableForceQuit,
+                .disableSessionTermination, .disableAppleMenu,
                 .disableHideApplication
             ]
         }
@@ -31,169 +27,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
             try bundle.ensureExists()
             self.bundle = bundle
 
-            try runFirstBootSetupIfNeeded(bundle: bundle)
+            guard let paths = QEMUArgs.resolvePaths() else {
+                throw NSError(domain: "Maix", code: 10, userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Maix.app is missing its qemu framework or resources. Rebuild with ./build.sh."
+                ])
+            }
 
-            let agent = GuestAgentBridge()
-            self.guestAgent = agent
-            let config = try VMFactory.makeConfiguration(bundle: bundle, guestAgent: agent)
-            let machine = VZVirtualMachine(configuration: config)
-            machine.delegate = self
-            self.vm = machine
+            try runFirstBootSetupIfNeeded(bundle: bundle, paths: paths)
 
-            let controller = KioskWindowController(vm: machine)
+            let controller = KioskWindowController()
             self.controller = controller
             controller.show()
 
-            installEscapeMonitor()
+            let qemu = QEMUProcess()
+            qemu.onExit = { [weak self] status in
+                NSLog("QEMU exited with status \(status). Maix exiting.")
+                self?.controller?.window.orderOut(nil)
+                exit(status == 0 ? 0 : 1)
+            }
+            self.qemu = qemu
 
+            let argv = QEMUArgs.build(bundle: bundle, paths: paths)
+            let logURL = bundle.root.appendingPathComponent("qemu.log")
+            try qemu.start(paths: paths, args: argv, logURL: logURL)
+
+            controller.showSerialConsole(tailing: bundle.serialLog)
+            waitForSpiceSocket(bundle: bundle, controller: controller)
+
+            installEscapeMonitor()
             NSApp.activate(ignoringOtherApps: true)
 
-            machine.start { [weak self] result in
-                if case .failure(let error) = result {
-                    NSLog("VM start failed: \(error)")
-                    return
-                }
-                DispatchQueue.main.async {
-                    guard let self = self, let vm = self.vm else { return }
-                    self.balloonController = BalloonController(vm: vm, ceiling: Config.memorySize)
-                    self.balloonController?.start()
-                    do { try self.guestAgent?.start() }
-                    catch { NSLog("GuestAgentBridge start failed: \(error)") }
-                }
+            if Config.trialMode {
+                scheduleTrialShutdown()
             }
         } catch {
             NSLog("Fatal init error: \(error)")
             presentFatal(error)
         }
-
-        if Config.kioskMode {
-            installReactivationWatchdog()
-        }
-
-        if Config.trialMode {
-            scheduleTrialShutdown()
-        }
-    }
-
-    private func scheduleTrialShutdown() {
-        let seconds = Config.trialDurationSeconds
-        NSLog("Trial mode: will quit after \(Int(seconds))s.")
-        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
-            NSLog("Trial mode: time up, stopping VM and quitting.")
-            guard let vm = self?.vm else { NSApp.terminate(nil); return }
-            vm.stop { _ in
-                DispatchQueue.main.async { exit(0) }
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { exit(0) }
-        }
-    }
-
-    private func installDefaultMenu() {
-        let main = NSMenu()
-
-        let appMenuItem = NSMenuItem()
-        main.addItem(appMenuItem)
-        let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "Quit Maix",
-                        action: #selector(NSApplication.terminate(_:)),
-                        keyEquivalent: "q")
-        appMenuItem.submenu = appMenu
-
-        let viewMenuItem = NSMenuItem()
-        main.addItem(viewMenuItem)
-        let viewMenu = NSMenu(title: "View")
-        let fs = NSMenuItem(
-            title: "Toggle Full Screen",
-            action: #selector(NSWindow.toggleFullScreen(_:)),
-            keyEquivalent: "f"
-        )
-        fs.keyEquivalentModifierMask = [.command, .control]
-        viewMenu.addItem(fs)
-        viewMenuItem.submenu = viewMenu
-
-        NSApp.mainMenu = main
-    }
-
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        !Config.kioskMode
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let vm = vm, vm.state == .running || vm.state == .paused else { return .terminateNow }
-        vm.stop { _ in
-            DispatchQueue.main.async { NSApp.reply(toApplicationShouldTerminate: true) }
-        }
-        return .terminateLater
+        qemu?.terminate()
+        return .terminateNow
     }
 
-    func guestDidStop(_ virtualMachine: VZVirtualMachine) {
-        NSLog("Guest stopped cleanly. Exiting kiosk.")
-        balloonController?.stop()
-        guestAgent?.stop()
-        exit(0)
-    }
+    // MARK: - First boot
 
-    func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
-        NSLog("Guest stopped with error: \(error). Exiting with failure.")
-        balloonController?.stop()
-        guestAgent?.stop()
-        exit(1)
-    }
-
-    private func restartVM() {
-        guard let bundle = bundle else { return }
-        balloonController?.stop(); balloonController = nil
-        guestAgent?.stop()
-        let agent = GuestAgentBridge()
-        guestAgent = agent
-        do {
-            let config = try VMFactory.makeConfiguration(bundle: bundle, guestAgent: agent)
-            let machine = VZVirtualMachine(configuration: config)
-            machine.delegate = self
-            self.vm = machine
-            controller?.vmView.virtualMachine = machine
-            machine.start { [weak self] result in
-                if case .failure(let error) = result {
-                    NSLog("VM restart failed: \(error)")
-                    return
-                }
-                DispatchQueue.main.async {
-                    guard let self = self, let vm = self.vm else { return }
-                    self.balloonController = BalloonController(vm: vm, ceiling: Config.memorySize)
-                    self.balloonController?.start()
-                    do { try self.guestAgent?.start() }
-                    catch { NSLog("GuestAgentBridge restart failed: \(error)") }
-                }
-            }
-        } catch {
-            NSLog("VM restart config error: \(error)")
-        }
-    }
-
-    private func installReactivationWatchdog() {
-        let nc = NSWorkspace.shared.notificationCenter
-        nc.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
-                       object: nil, queue: .main) { _ in
-            NSApp.activate(ignoringOtherApps: true)
-        }
-        Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            if !NSApp.isActive {
-                NSApp.activate(ignoringOtherApps: true)
-            }
-            self.controller?.window.orderFrontRegardless()
-        }
-    }
-
-    private func runFirstBootSetupIfNeeded(bundle: VMBundle) throws {
+    private func runFirstBootSetupIfNeeded(bundle: VMBundle, paths: QEMUArgs.Paths) throws {
         guard bundle.isFirstRun else { return }
-        NSLog("First-run setup: nvram missing.")
-
+        NSLog("First-run setup: efi_vars missing.")
+        try bundle.ensureEFIVars(from: paths.edk2VarsTemplate)
         try bundle.ensureBlankDiskImage()
 
         if !FileManager.default.fileExists(atPath: bundle.installerISO.path) {
             guard let picked = promptForInstallerISO() else {
-                throw NSError(domain: "MaixKiosk", code: 2, userInfo: [
+                throw NSError(domain: "Maix", code: 2, userInfo: [
                     NSLocalizedDescriptionKey: "First-run setup cancelled: no installer ISO selected."
                 ])
             }
@@ -204,8 +93,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
 
     private func promptForInstallerISO() -> URL? {
         let panel = NSOpenPanel()
-        panel.title = "Select Fedora installer ISO"
-        panel.message = "First boot: pick the installer ISO. It will be copied into ~/MaixVM/ and used to install the guest OS."
+        panel.title = "Select installer ISO"
+        panel.message = "First boot: pick the installer ISO. It will be copied into ~/MaixVM/."
         panel.allowedContentTypes = [UTType(filenameExtension: "iso"), UTType.diskImage].compactMap { $0 }
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
@@ -213,43 +102,117 @@ final class AppDelegate: NSObject, NSApplicationDelegate, VZVirtualMachineDelega
         return panel.runModal() == .OK ? panel.url : nil
     }
 
+    // MARK: - Menu / escape
+
+    private func installDefaultMenu() {
+        let main = NSMenu()
+        let appItem = NSMenuItem()
+        main.addItem(appItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "Quit Maix",
+                        action: #selector(NSApplication.terminate(_:)),
+                        keyEquivalent: "q")
+        appItem.submenu = appMenu
+        NSApp.mainMenu = main
+    }
+
     private func installEscapeMonitor() {
-        let handler: (NSEvent) -> Void = { [weak self] event in
+        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             if flags.contains(.command) && event.keyCode == Config.escapeKeyCode {
                 DispatchQueue.main.async { self?.handleEscape() }
-            }
-        }
-        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            if flags.contains(.command) && event.keyCode == Config.escapeKeyCode {
-                handler(event)
                 return nil
             }
             return event
         }
-        NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: handler)
     }
 
     private func handleEscape() {
         let alert = NSAlert()
         alert.messageText = "Maintenance"
-        alert.informativeText = "Exit kiosk and stop the VM?"
+        alert.informativeText = "Stop the VM and exit Maix?"
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Exit")
-        let response = alert.runModal()
-        guard response == .alertSecondButtonReturn else { return }
-        vm?.stop { _ in
-            DispatchQueue.main.async { NSApp.terminate(nil) }
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        qemu?.terminate()
+    }
+
+    private func waitForSpiceSocket(bundle: VMBundle, controller: KioskWindowController) {
+        let src = DispatchSource.makeTimerSource(queue: .main)
+        src.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        var elapsed: Double = 0
+        src.setEventHandler { [weak self] in
+            elapsed += 0.5
+            if FileManager.default.fileExists(atPath: bundle.spiceSocket.path) {
+                src.cancel()
+                self?.socketWaiter = nil
+                self?.startSpice(bundle: bundle, controller: controller)
+            } else if elapsed > 30 {
+                src.cancel()
+                self?.socketWaiter = nil
+                NSLog("spice.sock never appeared after 30s.")
+            }
+        }
+        src.resume()
+        socketWaiter = src
+    }
+
+    private func startSpice(bundle: VMBundle, controller: KioskWindowController) {
+        let spice = SpiceIO(socketURL: bundle.spiceSocket)
+        let router = SpiceInputRouter()
+        router.metalView = controller.metalView
+        controller.metalView.inputDelegate = router
+        self.inputRouter = router
+
+        spice.onPrimaryDisplay = { [weak self] display in
+            self?.inputRouter?.display = display
+            self?.controller?.attach(display: display)
+        }
+        spice.onPrimaryInput = { [weak self] input in
+            self?.inputRouter?.input = input
+        }
+        spice.onDisconnect = {
+            NSLog("SPICE disconnected.")
+        }
+        spice.onError = { msg in
+            NSLog("SPICE error: \(msg)")
+        }
+        spice.onAgentConnected = { [weak self] in
+            // vdagent is up now — nudge the guest to match our window size.
+            self?.controller?.rescaleToFit()
+        }
+        spice.onDisplayUpdated = { [weak self] _ in
+            self?.controller?.handleDisplayUpdated()
+        }
+
+        do {
+            try spice.start()
+            guard spice.connect() else {
+                NSLog("SpiceIO.connect() returned false")
+                return
+            }
+            self.spice = spice
+            NSLog("SpiceIO started. Awaiting primary display...")
+        } catch {
+            NSLog("SpiceIO start failed: \(error)")
+        }
+    }
+
+    private func scheduleTrialShutdown() {
+        let seconds = Config.trialDurationSeconds
+        NSLog("Trial mode: will quit after \(Int(seconds))s.")
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+            NSLog("Trial mode: time up.")
+            self?.qemu?.terminate()
         }
     }
 
     private func presentFatal(_ error: Error) {
         let alert = NSAlert()
-        alert.messageText = "Kiosk failed to start"
+        alert.messageText = "Maix failed to start"
         alert.informativeText = String(describing: error)
         alert.addButton(withTitle: "Quit")
         alert.runModal()
-        NSApp.terminate(nil)
+        exit(1)
     }
 }

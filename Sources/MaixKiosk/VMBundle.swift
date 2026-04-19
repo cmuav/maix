@@ -1,21 +1,23 @@
 import Foundation
-import Virtualization
 
 struct VMBundle {
     let root: URL
     let diskImage: URL
-    let efiVariableStore: URL
-    let machineIdentifier: URL
+    let installerISO: URL
+    let efiVars: URL
+    let spiceSocket: URL
+    let serialLog: URL
 
     init() {
         self.root = URL(fileURLWithPath: Config.vmBundlePath, isDirectory: true)
         self.diskImage = root.appendingPathComponent(Config.diskImageName)
-        self.efiVariableStore = root.appendingPathComponent(Config.efiVariableStoreName)
-        self.machineIdentifier = root.appendingPathComponent(Config.machineIdentifierName)
+        self.installerISO = root.appendingPathComponent(Config.installerISOName)
+        self.efiVars = root.appendingPathComponent(Config.efiVarsName)
+        self.spiceSocket = root.appendingPathComponent("spice.sock")
+        self.serialLog = root.appendingPathComponent("serial.log")
     }
 
-    var installerISO: URL { root.appendingPathComponent("installer.iso") }
-    var isFirstRun: Bool { !FileManager.default.fileExists(atPath: efiVariableStore.path) }
+    var isFirstRun: Bool { !FileManager.default.fileExists(atPath: efiVars.path) }
 
     func ensureExists() throws {
         let fm = FileManager.default
@@ -37,24 +39,13 @@ struct VMBundle {
         try FileManager.default.copyItem(at: source, to: installerISO)
     }
 
-    func loadOrCreateMachineIdentifier() throws -> VZGenericMachineIdentifier {
-        if FileManager.default.fileExists(atPath: machineIdentifier.path) {
-            let data = try Data(contentsOf: machineIdentifier)
-            guard let id = VZGenericMachineIdentifier(dataRepresentation: data) else {
-                throw NSError(domain: "MaixKiosk", code: 1,
-                              userInfo: [NSLocalizedDescriptionKey: "Corrupt machine identifier"])
-            }
-            return id
-        }
-        let id = VZGenericMachineIdentifier()
-        try id.dataRepresentation.write(to: machineIdentifier)
-        return id
-    }
-
-    func loadOrCreateEFIVariableStore() throws -> VZEFIVariableStore {
-        if FileManager.default.fileExists(atPath: efiVariableStore.path) {
-            return VZEFIVariableStore(url: efiVariableStore)
-        }
-        return try VZEFIVariableStore(creatingVariableStoreAt: efiVariableStore)
+    /// Seed efi_vars.fd from the bundle's edk2-arm-vars.fd template if missing.
+    /// aarch64 pflash expects a 64 MiB region, so we pad the template with zeros.
+    func ensureEFIVars(from template: URL) throws {
+        guard !FileManager.default.fileExists(atPath: efiVars.path) else { return }
+        try FileManager.default.copyItem(at: template, to: efiVars)
+        let fh = try FileHandle(forWritingTo: efiVars)
+        try fh.truncate(atOffset: 64 * 1024 * 1024)
+        try fh.close()
     }
 }

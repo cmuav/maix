@@ -1,0 +1,4 @@
+module MaixStubs {
+    header "cgs_private.h"
+    export *
+}
