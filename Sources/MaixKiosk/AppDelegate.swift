@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var socketWaiter: DispatchSourceTimer?
     private var usbAuto: SpiceUSBAutoConnect?
     private var camera: CameraBridge?
+    private var battery: BatteryBridge?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if Config.kioskMode {
@@ -63,6 +64,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             cam.start()
             self.camera = cam
+
+            let batt = BatteryBridge(socketPath: bundle.batterySocket.path)
+            batt.start()
+            self.battery = batt
 
             controller.showSerialConsole(tailing: bundle.serialLog)
             waitForSpiceSocket(bundle: bundle, controller: controller)

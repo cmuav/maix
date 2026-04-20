@@ -218,14 +218,18 @@ final class CameraBridge: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         mode = .idle
     }
 
-    // MARK: - Idle UYVY stream
+    // Idle video stream
 
     private func startIdleSender() {
         stopIdleSender()
         guard dataFD >= 0 else { return }
-        let interval = 1.0 / Double(Self.targetFPS)
+        // Idle standby only needs to keep v4l2loopback's producer fed so
+        // consumers can STREAMON. 2 Hz is plenty — any app opening
+        // /dev/video0 stalls at most ~500 ms before the supervisor flips
+        // us to .live at camera framerate. Sending the standby at 30 Hz
+        // burned ~55 MB/s of Swift write() + chardev I/O for no reason.
         let t = DispatchSource.makeTimerSource(queue: q)
-        t.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(5))
+        t.schedule(deadline: .now(), repeating: 0.5, leeway: .milliseconds(100))
         t.setEventHandler { [weak self] in
             guard let self = self else { return }
             self.writeBytes(self.idleFrame)

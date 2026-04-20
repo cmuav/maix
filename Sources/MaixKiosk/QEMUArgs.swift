@@ -85,9 +85,10 @@ enum QEMUArgs {
         a += ["-L", paths.biosDir.path]
         a += ["-name", "Maix"]
         a += ["-machine", "virt,highmem=on,gic-version=3"]
-        a += ["-cpu", "host"]
+        a += ["-cpu", "host,pmu=off"]
         a += ["-accel", "hvf"]
-        a += ["-smp", "cpus=\(Config.cpuCount)"]
+        // Explicit topology gives the guest scheduler a real tree
+        a += ["-smp", "cpus=\(Config.cpuCount),sockets=1,cores=\(Config.cpuCount),threads=1"]
         a += ["-m", "\(Config.memorySizeMiB)"]
 
         // EFI firmware (code) + persistent NVRAM (vars)
@@ -96,9 +97,15 @@ enum QEMUArgs {
         a += ["-drive",
               "if=pflash,format=raw,unit=1,file=\(bundle.efiVars.path)"]
 
-        // Main disk
+        // Main disk. Dedicated iothread + multi-queue virtio-blk: I/O runs
+        // off qemu's main loop and the guest parallelises requests per vCPU.
+        // discard/detect-zeroes let `fstrim` inside the guest reclaim sparse
+        // blocks on the underlying Mac disk.
+        a += ["-object", "iothread,id=iothread0"]
         a += ["-drive",
-              "if=virtio,format=raw,cache=writeback,aio=threads,file=\(bundle.diskImage.path)"]
+              "if=none,id=hd0,format=raw,cache=writeback,aio=threads,"
+              + "discard=unmap,detect-zeroes=unmap,file=\(bundle.diskImage.path)"]
+        a += ["-device", "virtio-blk-pci,drive=hd0,iothread=iothread0,num-queues=4"]
 
         // Installer ISO (first boot)
         if FileManager.default.fileExists(atPath: bundle.installerISO.path) {
@@ -108,6 +115,9 @@ enum QEMUArgs {
 
         // Network (user-mode for now; bridged/vmnet requires entitlement or
         // sudo). hostfwd maps mbn.local:2222 -> guest:22 for debugging.
+        // Multi-queue virtio-net requires a netdev that supports it
+        // (tap + vhost-net). Slirp is single-queue, so stick with a plain
+        // virtio-net-pci here; bridged/vmnet can revisit multi-queue later.
         a += ["-netdev", "user,id=net0,hostfwd=tcp::2222-:22"]
         a += ["-device", "virtio-net-pci,netdev=net0"]
 
@@ -116,7 +126,7 @@ enum QEMUArgs {
         a += ["-device", "usb-kbd,bus=xhci.0"]
         a += ["-device", "usb-tablet,bus=xhci.0"]
 
-        // SPICE USB redirection slots. Host-side CSUSBManager claims devices
+        // SPICE USB redirection slots: Host-side CSUSBManager claims devices
         // via libusb and tunnels URBs over these chardevs. One device per slot.
         for i in 0..<usbRedirSlotCount {
             a += ["-chardev", "spicevmc,name=usbredir,id=usbredirchardev\(i)"]
@@ -128,6 +138,9 @@ enum QEMUArgs {
         // the guest framebuffer is large enough for the kiosk window before
         // vdagent negotiates a dynamic resize.
         let (xres, yres) = primaryScreenPixels()
+        // Venus/blob-resources aren't supported by UTM's vendored
+        // virglrenderer build - leaving the device with just the OpenGL
+        // path. Revisit if we vendor a newer virglrenderer.
         a += ["-device", "virtio-gpu-gl-pci,xres=\(xres),yres=\(yres)"]
 
         // RTC / entropy / balloon
@@ -135,11 +148,11 @@ enum QEMUArgs {
         a += ["-device", "virtio-rng-pci"]
         a += ["-device", "virtio-balloon-pci"]
 
-        // Audio: qemu plays directly via CoreAudio on the host.
-        // Guest sees Intel HDA (broadly-supported by Linux snd_hda_intel).
+        // Audio: qemu plays directly via CoreAudio on the host. virtio-sound
+        // has ~half the per-frame CPU cost of emulated Intel HDA and Linux's
+        // snd_virtio driver has been solid since 6.3.
         a += ["-audiodev", "coreaudio,id=audio0"]
-        a += ["-device", "intel-hda"]
-        a += ["-device", "hda-duplex,audiodev=audio0"]
+        a += ["-device", "virtio-sound-pci,audiodev=audio0"]
 
         // Serial log (for debugging)
         a += ["-serial", "file:\(bundle.serialLog.path)"]
@@ -161,7 +174,7 @@ enum QEMUArgs {
 
         // Camera side-channel. qemu listens on ~/MaixVM/camera.sock; Maix
         // connects as client and writes an MJPEG stream. Guest sees
-        // /dev/virtio-ports/com.cmuav.camera — a guest-side daemon reads the
+        // /dev/virtio-ports/com.cmuav.camera - a guest-side daemon reads the
         // MJPEG stream and pipes it into v4l2loopback as /dev/video0.
         try? FileManager.default.removeItem(at: bundle.cameraSocket)
         try? FileManager.default.removeItem(at: bundle.cameraControlSocket)
@@ -176,7 +189,15 @@ enum QEMUArgs {
         a += ["-device",
               "virtserialport,chardev=maixcamctl,name=com.cmuav.camera.control"]
 
-        // No default devices / no local display — SPICE is our display.
+        // Battery side-channel. Host pushes event-driven JSON lines; guest
+        // daemon relays to /sys/module/test_power/parameters/*.
+        try? FileManager.default.removeItem(at: bundle.batterySocket)
+        a += ["-chardev",
+              "socket,id=maixbatt,path=\(bundle.batterySocket.path),server=on,wait=off"]
+        a += ["-device",
+              "virtserialport,chardev=maixbatt,name=com.cmuav.battery"]
+
+        // SPICE is our only display
         a += ["-nodefaults"]
         a += ["-vga", "none"]
         a += ["-display", "none"]

@@ -21,6 +21,7 @@ struct VMBundle {
     let usbConfig: URL
     var cameraSocket: URL { root.appendingPathComponent("camera.sock") }
     var cameraControlSocket: URL { root.appendingPathComponent("camera-control.sock") }
+    var batterySocket: URL { root.appendingPathComponent("battery.sock") }
 
     func ensureUSBConfigExists() {
         guard !FileManager.default.fileExists(atPath: usbConfig.path) else { return }
